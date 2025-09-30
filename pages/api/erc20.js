@@ -1,7 +1,8 @@
 export const config = { runtime: "edge" };
 
 const ETH_RPC = "https://cloudflare-eth.com";
-const BLOCKS_TO_SCAN = 600; // ~2 hours; tweak as needed
+// Wider window for stablecoin transfers (~8–10 hours depending on network conditions)
+const BLOCKS_TO_SCAN = 2500;
 
 const TOKENS = [
   { symbol: "USDC", address: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", decimals: 6 },
@@ -37,10 +38,12 @@ export default async function handler(req) {
     const price = t.symbol === "USDT" ? usdUSDT : usdUSDC;
     const filter = { fromBlock, toBlock, address: t.address, topics: [TRANSFER_TOPIC] };
     const logs = await rpc("eth_getLogs", [filter]);
+
     for (const log of logs.result || []) {
-      const raw = BigInt(log.data);
+      const raw = BigInt(log.data || "0x0");
       const amount = Number(raw) / 10 ** t.decimals;
       const usd = amount * price;
+
       if (usd >= minUsd) {
         items.push({
           chain: "ethereum",
@@ -50,7 +53,7 @@ export default async function handler(req) {
           from: "0x" + log.topics[1].slice(26),
           to: "0x" + log.topics[2].slice(26),
           hash: log.transactionHash,
-          ts: Date.now() / 1000,
+          ts: Date.now() / 1000, // cheaper than extra block lookups for prototype
         });
       }
     }
