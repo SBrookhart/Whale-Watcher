@@ -1,7 +1,8 @@
 export const config = { runtime: "edge" };
 
 const SOL_RPC = "https://api.mainnet-beta.solana.com";
-const SLOTS_TO_SCAN = 4;
+// Wider slot window, still modest for public RPC
+const SLOTS_TO_SCAN = 20;
 
 async function rpc(method, params = []) {
   const r = await fetch(SOL_RPC, {
@@ -18,7 +19,7 @@ export default async function handler(req) {
   const minUsd = Number(searchParams.get("minUsd") || "1000000");
   const stableOnly = searchParams.get("stableOnly") === "1";
 
-  // Placeholder: requires indexer for USDC mint transfers (EPjFWd...Td1v).
+  // Stablecoin-only needs an indexer for USDC mint transfers (EPjFWd…Td1v)
   if (stableOnly) {
     return new Response(
       JSON.stringify({
@@ -38,11 +39,7 @@ export default async function handler(req) {
     const slot = head - i;
     const blk = await rpc("getBlock", [
       slot,
-      {
-        maxSupportedTransactionVersion: 0,
-        transactionDetails: "full",
-        rewards: false,
-      },
+      { maxSupportedTransactionVersion: 0, transactionDetails: "full", rewards: false },
     ]);
     const txs = blk.result?.transactions || [];
     for (const tx of txs) {
@@ -53,7 +50,8 @@ export default async function handler(req) {
       const ix = message.instructions || [];
       for (const ins of ix) {
         const programId = message.accountKeys[ins.programIdIndex]?.toString?.() || "";
-        if (programId !== "11111111111111111111111111111111") continue; // System program
+        // System program only (native SOL transfers)
+        if (programId !== "11111111111111111111111111111111") continue;
 
         const data = typeof ins.data === "string" ? ins.data : "";
         if (!data) continue;
@@ -61,6 +59,7 @@ export default async function handler(req) {
         if (buf.length < 12) continue;
         const kind = buf.readUInt32LE(0);
         if (kind !== 2) continue; // transfer
+
         const lamports = Number(buf.readBigUInt64LE(4));
         const sol = lamports / 1e9;
         const usd = sol * usdSol;
