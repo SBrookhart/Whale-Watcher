@@ -39,8 +39,13 @@ export default async function handler(req) {
   }
 
   const [eth, erc20, btc, sol] = await Promise.all([
-    j("/api/eth"), j("/api/erc20"), j("/api/btc"), j("/api/sol")
+    j("/api/eth"),
+    j("/api/erc20"),
+    j("/api/btc"),
+    j("/api/sol")
   ]);
 
   return new Response(JSON.stringify({ minUsd, eth, erc20, btc, sol }), {
-    headers: { "content-type": "application
+    headers: { "content-type": "application/json" }
+  });
+}
