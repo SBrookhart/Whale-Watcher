@@ -3,9 +3,8 @@ export const config = { runtime: "edge" };
 import { hasAlchemy, getEnv } from "../../lib/providers";
 
 const ETH_RPC = "https://cloudflare-eth.com";
-const FALLBACK_BLOCKS = 200;
+const FALLBACK_BLOCKS = 600; // ~2+ hours
 
-// helper: JSON-RPC to public ETH
 async function rpc(method, params = []) {
   const r = await fetch(ETH_RPC, {
     method: "POST",
@@ -18,82 +17,80 @@ async function rpc(method, params = []) {
 async function ensureUsdEth(usdEth) {
   if (usdEth > 0) return usdEth;
   try {
-    const r = await fetch(
-      "https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd",
-      { cache: "no-store" }
-    );
+    const r = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd", { cache: "no-store" });
     const j = await r.json();
     return Number(j?.ethereum?.usd || 0);
-  } catch {
-    return 0;
-  }
+  } catch { return 0; }
 }
 
+/** ---------- Alchemy (indexer) with pagination + wide window ---------- */
 async function alchemyTransfers(minUsd, usdEth) {
   const { ALCHEMY_ETH_MAINNET_KEY } = getEnv();
-  const alchemyUrl = `https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_ETH_MAINNET_KEY}`;
+  const base = `https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_ETH_MAINNET_KEY}`;
 
-  // Anchor the window to a recent block to avoid stale pages
+  // Use a recent fromBlock anchor to avoid stale pages
   const latest = await rpc("eth_blockNumber");
   const head = parseInt(latest.result, 16);
-  const fromBlock = "0x" + Math.max(head - 5000, 0).toString(16); // ~1–1.5 days
+  const fromBlock = "0x" + Math.max(head - 12000, 0).toString(16); // ~3–4 days
 
-  // Ask for BOTH external + internal, exclude zeros, with metadata
-  const body = {
-    id: 1,
-    jsonrpc: "2.0",
-    method: "alchemy_getAssetTransfers",
-    params: [
-      {
+  let pageKey = undefined;
+  const items = [];
+  for (let i = 0; i < 3; i++) { // up to 3 pages (≈ 3000 transfers)
+    const body = {
+      id: 1,
+      jsonrpc: "2.0",
+      method: "alchemy_getAssetTransfers",
+      params: [{
         category: ["external", "internal"],
         withMetadata: true,
         order: "desc",
         fromBlock,
         excludeZeroValue: true,
-        maxCount: "0x3e8" // 1000
+        maxCount: "0x3e8", // 1000
+        pageKey
+      }]
+    };
+    const res = await fetch(base, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) break;
+    const json = await res.json();
+    const txs = json?.result?.transfers || [];
+
+    for (const t of txs) {
+      const eth = Number(t.value || 0);
+      if (!eth) continue;
+      const usd = eth * usdEth;
+      if (usd >= minUsd) {
+        items.push({
+          chain: "ethereum",
+          kind: "ETH",
+          amount: eth,
+          usd,
+          from: t.from,
+          to: t.to,
+          hash: t.hash,
+          ts: t.metadata?.blockTimestamp ? Math.floor(new Date(t.metadata.blockTimestamp).getTime()/1000) : Math.floor(Date.now()/1000),
+        });
       }
-    ]
-  };
-
-  const res = await fetch(alchemyUrl, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-  });
-
-  if (!res.ok) throw new Error("Alchemy ETH transfers error");
-  const json = await res.json();
-  const txs = json?.result?.transfers || [];
-
-  const items = [];
-  for (const t of txs) {
-    // Native ETH is a decimal string of ETH units
-    const eth = Number(t.value || 0);
-    const usd = eth * usdEth;
-    if (usd >= minUsd && eth > 0) {
-      items.push({
-        chain: "ethereum",
-        kind: "ETH",
-        amount: eth,
-        usd,
-        from: t.from,
-        to: t.to,
-        hash: t.hash,
-        ts: t.metadata?.blockTimestamp
-          ? Math.floor(new Date(t.metadata.blockTimestamp).getTime() / 1000)
-          : Math.floor(Date.now() / 1000),
-      });
     }
+
+    pageKey = json?.result?.pageKey;
+    if (!pageKey) break;
   }
-  items.sort((a, b) => b.usd - a.usd);
+
+  items.sort((a,b)=>b.usd - a.usd);
   return items;
 }
 
+/** ---------- Public RPC fallback scan (merge safety net) ---------- */
 async function fallbackScan(minUsd, usdEth) {
   const latest = await rpc("eth_blockNumber");
   const head = parseInt(latest.result, 16);
-
   const items = [];
+
   for (let i = 0; i < FALLBACK_BLOCKS; i++) {
     const numHex = "0x" + (head - i).toString(16);
     const b = await rpc("eth_getBlockByNumber", [numHex, true]);
@@ -101,8 +98,9 @@ async function fallbackScan(minUsd, usdEth) {
     for (const tx of txs) {
       const wei = BigInt(tx.value || "0x0");
       const eth = Number(wei) / 1e18;
+      if (!eth) continue;
       const usd = eth * usdEth;
-      if (usd >= minUsd && eth > 0) {
+      if (usd >= minUsd) {
         items.push({
           chain: "ethereum",
           kind: "ETH",
@@ -111,14 +109,13 @@ async function fallbackScan(minUsd, usdEth) {
           from: tx.from,
           to: tx.to,
           hash: tx.hash,
-          ts: Number(
-            b.result?.timestamp ? parseInt(b.result.timestamp, 16) : Date.now() / 1000
-          ),
+          ts: Number(b.result?.timestamp ? parseInt(b.result.timestamp, 16) : Date.now()/1000),
         });
       }
     }
   }
-  items.sort((a, b) => b.usd - a.usd);
+
+  items.sort((a,b)=>b.usd - a.usd);
   return items;
 }
 
@@ -130,13 +127,27 @@ export default async function handler(req) {
 
   let items = [];
   try {
-    if (hasAlchemy()) items = await alchemyTransfers(minUsd, usdEth);
-    else items = await fallbackScan(minUsd, usdEth);
+    if (hasAlchemy()) {
+      const a = await alchemyTransfers(minUsd, usdEth);
+      // If indexer returns thin results, merge with fallback
+      const needsFallback = a.length < 3;
+      if (needsFallback) {
+        const f = await fallbackScan(minUsd, usdEth);
+        items = [...a, ...f];
+      } else {
+        items = a;
+      }
+    } else {
+      items = await fallbackScan(minUsd, usdEth);
+    }
   } catch {
-    items = [];
+    // final guard
+    try { items = await fallbackScan(minUsd, usdEth); } catch { items = []; }
   }
 
-  return new Response(JSON.stringify({ items }), {
-    headers: { "content-type": "application/json" },
-  });
+  // de-duplicate by tx hash
+  const seen = new Set();
+  items = items.filter(it => (seen.has(it.hash) ? false : (seen.add(it.hash), true)));
+
+  return new Response(JSON.stringify({ items }), { headers: { "content-type": "application/json" } });
 }
