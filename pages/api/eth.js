@@ -2,13 +2,8 @@ export const config = { runtime: "edge" };
 
 import { hasAlchemy, getEnv } from "../../lib/providers";
 
-/**
- * Uses Alchemy Transfers API when ALCHEMY_ETH_MAINNET_KEY is set.
- * Falls back to Cloudflare RPC scan if not set (works, but less comprehensive).
- */
-
 const ETH_RPC = "https://cloudflare-eth.com";
-const FALLBACK_BLOCKS = 200; // used only if no Alchemy key present
+const FALLBACK_BLOCKS = 200;
 
 async function rpc(method, params = []) {
   const r = await fetch(ETH_RPC, {
@@ -19,17 +14,26 @@ async function rpc(method, params = []) {
   return r.json();
 }
 
+async function ensureUsdEth(usdEth) {
+  if (usdEth > 0) return usdEth;
+  try {
+    const r = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd", { cache: "no-store" });
+    const j = await r.json();
+    return Number(j?.ethereum?.usd || 0);
+  } catch { return 0; }
+}
+
 async function alchemyTransfers(minUsd, usdEth) {
   const { ALCHEMY_ETH_MAINNET_KEY } = getEnv();
   const url = `https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_ETH_MAINNET_KEY}`;
 
-  // alchemy_getAssetTransfers for native (ETH) "external" transfers
+  // Include BOTH external and internal to catch contract-mediated big moves.
   const body = {
     id: 1,
     jsonrpc: "2.0",
     method: "alchemy_getAssetTransfers",
     params: [{
-      category: ["external"],
+      category: ["external", "internal"],
       withMetadata: true,
       order: "desc",
       maxCount: "0x3e8" // 1000
@@ -48,8 +52,7 @@ async function alchemyTransfers(minUsd, usdEth) {
 
   const items = [];
   for (const t of txs) {
-    // native ETH transfers expose value as a decimal string of ETH
-    const eth = Number(t.value || 0);
+    const eth = Number(t.value || 0); // ETH as decimal string
     const usd = eth * usdEth;
     if (usd >= minUsd && eth > 0) {
       items.push({
@@ -101,8 +104,9 @@ async function fallbackScan(minUsd, usdEth) {
 
 export default async function handler(req) {
   const { searchParams } = new URL(req.url);
-  const usdEth = Number(searchParams.get("usdEth") || "0");
   const minUsd = Number(searchParams.get("minUsd") || "1000000");
+  let usdEth = Number(searchParams.get("usdEth") || "0");
+  usdEth = await ensureUsdEth(usdEth);
 
   let items = [];
   try {
@@ -111,12 +115,9 @@ export default async function handler(req) {
     } else {
       items = await fallbackScan(minUsd, usdEth);
     }
-  } catch (e) {
-    // graceful failure → empty list
+  } catch {
     items = [];
   }
 
-  return new Response(JSON.stringify({ items }), {
-    headers: { "content-type": "application/json" },
-  });
+  return new Response(JSON.stringify({ items }), { headers: { "content-type": "application/json" } });
 }
