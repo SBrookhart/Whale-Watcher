@@ -1,7 +1,8 @@
 export const config = { runtime: "edge" };
 
 const ETH_RPC = "https://cloudflare-eth.com";
-const BLOCKS_TO_SCAN = 20;
+// Wider window so you actually see whales without constant refreshes (~40–50 min).
+const BLOCKS_TO_SCAN = 200;
 
 async function rpc(method, params = []) {
   const r = await fetch(ETH_RPC, {
@@ -26,8 +27,11 @@ export default async function handler(req) {
     const b = await rpc("eth_getBlockByNumber", [numHex, true]);
     const txs = b.result?.transactions || [];
     for (const tx of txs) {
-      const eth = Number(BigInt(tx.value) / 10n ** 18n);
+      // Convert wei -> ETH without integer truncation
+      const wei = BigInt(tx.value || "0x0");
+      const eth = Number(wei) / 1e18; // acceptable for UI; not for accounting
       const usd = eth * usdEth;
+
       if (usd >= minUsd && eth > 0) {
         items.push({
           chain: "ethereum",
@@ -38,7 +42,7 @@ export default async function handler(req) {
           to: tx.to,
           hash: tx.hash,
           ts: Number(
-            b.result.timestamp ? parseInt(b.result.timestamp, 16) : Date.now() / 1000
+            b.result?.timestamp ? parseInt(b.result.timestamp, 16) : Date.now() / 1000
           ),
         });
       }
