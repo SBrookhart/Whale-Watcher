@@ -2,13 +2,7 @@ export const config = { runtime: "edge" };
 
 import { hasAlchemy, getEnv } from "../../lib/providers";
 
-/**
- * Uses Alchemy Transfers API for ERC-20 token transfers.
- * If no key present, falls back to Cloudflare RPC + getLogs (older approach).
- */
-
 const ETH_RPC = "https://cloudflare-eth.com";
-// fallback window (blocks) if no Alchemy:
 const FALLBACK_BLOCKS = 2500;
 
 const TOKENS = [
@@ -16,9 +10,7 @@ const TOKENS = [
   { symbol: "USDT", address: "0xdac17f958d2ee523a2206206994597c13d831ec7", decimals: 6 },
 ];
 
-// keccak256("Transfer(address,address,uint256)")
-const TRANSFER_TOPIC =
-  "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+const TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 
 async function rpc(method, params = []) {
   const r = await fetch(ETH_RPC, {
@@ -29,11 +21,20 @@ async function rpc(method, params = []) {
   return r.json();
 }
 
+async function ensureUsd(sym, incoming) {
+  if (incoming > 0) return incoming;
+  try {
+    const id = sym === "USDT" ? "tether" : "usd-coin";
+    const r = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${id}&vs_currencies=usd`, { cache: "no-store" });
+    const j = await r.json();
+    return Number(j?.[id]?.usd || 1);
+  } catch { return 1; }
+}
+
 async function alchemyErc20(minUsd, usdUSDC, usdUSDT) {
   const { ALCHEMY_ETH_MAINNET_KEY } = getEnv();
   const url = `https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_ETH_MAINNET_KEY}`;
 
-  // Ask for recent ERC-20 transfers, filtering for USDC + USDT contracts explicitly
   const contracts = TOKENS.map(t => t.address.toLowerCase());
 
   const body = {
@@ -45,7 +46,7 @@ async function alchemyErc20(minUsd, usdUSDC, usdUSDT) {
       contractAddresses: contracts,
       withMetadata: true,
       order: "desc",
-      maxCount: "0x3e8" // 1000
+      maxCount: "0x3e8"
     }]
   };
 
@@ -61,16 +62,15 @@ async function alchemyErc20(minUsd, usdUSDC, usdUSDT) {
 
   const items = [];
   for (const t of txs) {
-    const sym = t.asset?.toUpperCase?.() || ""; // often "USDC"/"USDT"
+    const sym = t.asset?.toUpperCase?.() || "";
     const tok = TOKENS.find(x => x.symbol === sym || x.address.toLowerCase() === (t.rawContract?.address || "").toLowerCase());
     if (!tok) continue;
 
-    // Alchemy returns value (token quantity) as a decimal string (not scaled)
     const amount = Number(t.value || 0);
-    const price = sym === "USDT" ? usdUSDT : usdUSDC;
+    const price = tok.symbol === "USDT" ? usdUSDT : usdUSDC;
     const usd = amount * price;
 
-    if (usd >= minUsd) {
+    if (usd >= minUsd && amount > 0) {
       items.push({
         chain: "ethereum",
         kind: tok.symbol,
@@ -99,12 +99,11 @@ async function fallbackErc20(minUsd, usdUSDC, usdUSDT) {
     const price = t.symbol === "USDT" ? usdUSDT : usdUSDC;
     const filter = { fromBlock, toBlock, address: t.address, topics: [TRANSFER_TOPIC] };
     const logs = await rpc("eth_getLogs", [filter]);
-
     for (const log of logs.result || []) {
       const raw = BigInt(log.data || "0x0");
       const amount = Number(raw) / 10 ** t.decimals;
       const usd = amount * price;
-      if (usd >= minUsd) {
+      if (usd >= minUsd && amount > 0) {
         items.push({
           chain: "ethereum",
           kind: t.symbol,
@@ -118,7 +117,6 @@ async function fallbackErc20(minUsd, usdUSDC, usdUSDT) {
       }
     }
   }
-
   items.sort((a,b)=>b.usd - a.usd);
   return items;
 }
@@ -126,8 +124,11 @@ async function fallbackErc20(minUsd, usdUSDC, usdUSDT) {
 export default async function handler(req) {
   const { searchParams } = new URL(req.url);
   const minUsd = Number(searchParams.get("minUsd") || "1000000");
-  const usdUSDC = Number(searchParams.get("usdUSDC") || "1");
-  const usdUSDT = Number(searchParams.get("usdUSDT") || "1");
+  let usdUSDC = Number(searchParams.get("usdUSDC") || "0");
+  let usdUSDT = Number(searchParams.get("usdUSDT") || "0");
+
+  usdUSDC = await ensureUsd("USDC", usdUSDC);
+  usdUSDT = await ensureUsd("USDT", usdUSDT);
 
   let items = [];
   try {
@@ -136,11 +137,9 @@ export default async function handler(req) {
     } else {
       items = await fallbackErc20(minUsd, usdUSDC, usdUSDT);
     }
-  } catch (e) {
+  } catch {
     items = [];
   }
 
-  return new Response(JSON.stringify({ items }), {
-    headers: { "content-type": "application/json" },
-  });
+  return new Response(JSON.stringify({ items }), { headers: { "content-type": "application/json" } });
 }
